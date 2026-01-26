@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Barnes-Hut Gravity Simulation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            background: #000;
+            overflow: hidden;
+            font-family: 'Courier New', monospace;
+            color: #fff;
+        }
+        
+        canvas {
+            display: block;
+            background: #000;
+        }
+        
+        #controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #333;
+        }
+        
+        #info {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #333;
+            font-size: 12px;
+        }
+        
+        button {
+            background: #222;
+            color: #0f0;
+            border: 1px solid #0f0;
+            padding: 8px 15px;
+            margin: 5px 0;
+            cursor: pointer;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            display: block;
+            width: 100%;
+        }
+        
+        button:hover {
+            background: #0f0;
+            color: #000;
+        }
+        
+        label {
+            display: block;
+            margin: 10px 0 5px 0;
+            font-size: 12px;
+        }
+        
+        input[type="range"] {
+            width: 100%;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    
+    <div id="controls">
+        <h3 style="margin-bottom: 10px;">Controls</h3>
+        <button id="resetBtn">Reset</button>
+        <button id="addBodyBtn">Add Random Body</button>
+        <button id="clearBtn">Clear All</button>
+        
+        <label>Bodies: <span id="bodyCount">0</span></label>
+        
+        <label>Initial Bodies: <span id="initialBodiesVal">70</span></label>
+        <input type="range" id="initialBodiesSlider" min="10" max="64000" step="10" value="70">
+        
+        <label>Gravity Strength: <span id="gravityVal">1.0</span></label>
+        <input type="range" id="gravitySlider" min="0.1" max="5" step="0.1" value="1.0">
+        
+        <label>Time Scale: <span id="timeVal">1.0</span></label>
+        <input type="range" id="timeSlider" min="0.1" max="3" step="0.1" value="1.0">
+        
+        <label>Theta: <span id="thetaVal">0.5</span></label>
+        <input type="range" id="thetaSlider" min="0.1" max="3.0" step="0.1" value="0.5">
+    </div>
+    
+    <div id="info">
+        <div>FPS: <span id="fps">0</span></div>
+        <div>Nodes: <span id="nodeCount">0</span></div>
+        <div style="margin-top: 10px; font-size: 10px;">
+            Click to add bodies<br>
+            Theta controls accuracy<br>
+            (lower = more accurate)
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        
+        window.addEventListener('resize', () => {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        });
+        
+        // Celestial body class
+        class Body {
+            constructor(x, y, vx, vy, mass) {
+                this.x = x;
+                this.y = y;
+                this.vx = vx;
+                this.vy = vy;
+                this.mass = mass;
+                this.ax = 0;
+                this.ay = 0;
+                
+                // Visual properties based on mass
+                this.radius = Math.max(2, Math.min(8, Math.sqrt(mass) * 0.5));
+                this.color = this.getColor(mass);
+            }
+            
+            getColor(mass) {
+                if (mass > 500) return '#ffaa00'; // Large - orange
+                if (mass > 200) return '#ff4444'; // Medium - red
+                if (mass > 50) return '#4444ff';  // Small - blue
+                return '#ffffff';                  // Tiny - white
+            }
+            
+            update(dt) {
+                this.vx += this.ax * dt;
+                this.vy += this.ay * dt;
+                this.x += this.vx * dt;
+                this.y += this.vy * dt;
+                
+                // Reset acceleration
+                this.ax = 0;
+                this.ay = 0;
+            }
+            
+            draw(ctx) {
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+                ctx.fillStyle = this.color;
+                ctx.fill();
+                
+                // Add glow effect
+                const gradient = ctx.createRadialGradient(this.x, this.y, 0, this.x, this.y, this.radius * 2);
+                gradient.addColorStop(0, this.color);
+                gradient.addColorStop(1, 'transparent');
+                ctx.fillStyle = gradient;
+                ctx.fill();
+            }
+        }
+        
+        // QuadTree node for Barnes-Hut algorithm
+        class QuadNode {
+            constructor(x, y, width, height) {
+                this.x = x;
+                this.y = y;
+                this.width = width;
+                this.height = height;
+                
+                this.body = null;
+                this.totalMass = 0;
+                this.centerOfMassX = 0;
+                this.centerOfMassY = 0;
+                
+                this.children = null;
+            }
+            
+            isLeaf() {
+                return this.children === null;
+            }
+            
+            subdivide() {
+                const hw = this.width / 2;
+                const hh = this.height / 2;
+                
+                this.children = [
+                    new QuadNode(this.x, this.y, hw, hh),                    // NW
+                    new QuadNode(this.x + hw, this.y, hw, hh),               // NE
+                    new QuadNode(this.x, this.y + hh, hw, hh),               // SW
+                    new QuadNode(this.x + hw, this.y + hh, hw, hh)           // SE
+                ];
+            }
+            
+            getQuadrant(body) {
+                const midX = this.x + this.width / 2;
+                const midY = this.y + this.height / 2;
+                
+                const west = body.x < midX;
+                const north = body.y < midY;
+                
+                if (north && west) return 0; // NW
+                if (north && !west) return 1; // NE
+                if (!north && west) return 2; // SW
+                return 3; // SE
+            }
+            
+            insert(body) {
+                if (!this.contains(body)) return false;
+                
+                if (this.isLeaf()) {
+                    if (this.body === null) {
+                        this.body = body;
+                        this.updateMass();
+                        return true;
+                    } else {
+                        // Subdivide and redistribute
+                        const oldBody = this.body;
+                        this.body = null;
+                        this.subdivide();
+                        
+                        this.children[this.getQuadrant(oldBody)].insert(oldBody);
+                        this.children[this.getQuadrant(body)].insert(body);
+                        this.updateMass();
+                        return true;
+                    }
+                } else {
+                    const quadrant = this.getQuadrant(body);
+                    if (this.children[quadrant].insert(body)) {
+                        this.updateMass();
+                        return true;
+                    }
+                }
+                
+                return false;
+            }
+            
+            contains(body) {
+                return body.x >= this.x && body.x < this.x + this.width &&
+                       body.y >= this.y && body.y < this.y + this.height;
+            }
+            
+            updateMass() {
+                if (this.isLeaf()) {
+                    if (this.body) {
+                        this.totalMass = this.body.mass;
+                        this.centerOfMassX = this.body.x;
+                        this.centerOfMassY = this.body.y;
+                    }
+                } else {
+                    this.totalMass = 0;
+                    let weightedX = 0;
+                    let weightedY = 0;
+                    
+                    for (let child of this.children) {
+                        if (child.totalMass > 0) {
+                            this.totalMass += child.totalMass;
+                            weightedX += child.centerOfMassX * child.totalMass;
+                            weightedY += child.centerOfMassY * child.totalMass;
+                        }
+                    }
+                    
+                    if (this.totalMass > 0) {
+                        this.centerOfMassX = weightedX / this.totalMass;
+                        this.centerOfMassY = weightedY / this.totalMass;
+                    }
+                }
+            }
+            
+            calculateForce(body, theta, G) {
+                if (this.totalMass === 0) return;
+                
+                const dx = this.centerOfMassX - body.x;
+                const dy = this.centerOfMassY - body.y;
+                const distSq = dx * dx + dy * dy;
+                
+                if (distSq < 1) return; // Too close, skip
+                
+                if (this.isLeaf()) {
+                    if (this.body && this.body !== body) {
+                        const dist = Math.sqrt(distSq);
+                        const force = (G * this.totalMass) / (distSq + 100); // Softening
+                        
+                        body.ax += force * dx / dist;
+                        body.ay += force * dy / dist;
+                    }
+                } else {
+                    const s = this.width;
+                    const d = Math.sqrt(distSq);
+                    
+                    if (s / d < theta) {
+                        // Use approximation
+                        const dist = Math.sqrt(distSq);
+                        const force = (G * this.totalMass) / (distSq + 100);
+                        
+                        body.ax += force * dx / dist;
+                        body.ay += force * dy / dist;
+                    } else {
+                        // Recurse
+                        for (let child of this.children) {
+                            child.calculateForce(body, theta, G);
+                        }
+                    }
+                }
+            }
+            
+            countNodes() {
+                if (this.isLeaf()) return 1;
+                let count = 1;
+                for (let child of this.children) {
+                    count += child.countNodes();
+                }
+                return count;
+            }
+        }
+        
+        // Simulation
+        let bodies = [];
+        let G = 1.0;
+        let timeScale = 1.0;
+        let theta = 0.5;
+        let initialBodiesCount = 70;
+        
+        // Initialize with some bodies
+        function initBodies() {
+            bodies = [];
+            
+            // Calculate how many orbiting vs random bodies
+            const orbitingCount = Math.floor(initialBodiesCount * 0.7);
+            const randomCount = initialBodiesCount - orbitingCount - 1; // -1 for central body
+            
+            // Add a central massive body
+            bodies.push(new Body(canvas.width / 2, canvas.height / 2, 0, 0, 1000));
+            
+            // Add orbiting bodies
+            for (let i = 0; i < orbitingCount; i++) {
+                const angle = Math.random() * Math.PI * 2;
+                const distance = 100 + Math.random() * 300;
+                const x = canvas.width / 2 + Math.cos(angle) * distance;
+                const y = canvas.height / 2 + Math.sin(angle) * distance;
+                
+                // Orbital velocity
+                const speed = Math.sqrt(G * 1000 / distance) * 0.8 * 4.0;
+                const vx = -Math.sin(angle) * speed;
+                const vy = Math.cos(angle) * speed;
+                
+                const mass = 10 + Math.random() * 40;
+                bodies.push(new Body(x, y, vx, vy, mass));
+            }
+            
+            // Add some random fast bodies
+            for (let i = 0; i < randomCount; i++) {
+                const x = Math.random() * canvas.width;
+                const y = Math.random() * canvas.height;
+                const vx = (Math.random() - 0.5) * 2;
+                const vy = (Math.random() - 0.5) * 2;
+                const mass = 5 + Math.random() * 20;
+                bodies.push(new Body(x, y, vx, vy, mass));
+            }
+        }
+        
+        function addRandomBody() {
+            const x = Math.random() * canvas.width;
+            const y = Math.random() * canvas.height;
+            const vx = (Math.random() - 0.5) * 3;
+            const vy = (Math.random() - 0.5) * 3;
+            const mass = 10 + Math.random() * 100;
+            bodies.push(new Body(x, y, vx, vy, mass));
+        }
+        
+        let lastTime = performance.now();
+        let fps = 0;
+        let frameCount = 0;
+        let fpsTime = 0;
+        
+        function simulate() {
+            const currentTime = performance.now();
+            const elapsed = (currentTime - lastTime) / 1000;
+            lastTime = currentTime;
+            
+            // Calculate FPS
+            frameCount++;
+            fpsTime += elapsed;
+            if (fpsTime >= 1.0) {
+                fps = Math.round(frameCount / fpsTime);
+                frameCount = 0;
+                fpsTime = 0;
+            }
+            
+            const dt = Math.min(elapsed * timeScale, 0.05);
+            
+            // Build quad tree
+            const padding = 100;
+            const quadTree = new QuadNode(-padding, -padding, 
+                                         canvas.width + 2 * padding, 
+                                         canvas.height + 2 * padding);
+            
+            for (let body of bodies) {
+                quadTree.insert(body);
+            }
+            
+            // Calculate forces using Barnes-Hut
+            for (let body of bodies) {
+                quadTree.calculateForce(body, theta, G);
+            }
+            
+            // Update bodies
+            for (let body of bodies) {
+                body.update(dt);
+            }
+            
+            // Remove bodies that are too far away
+            bodies = bodies.filter(body => {
+                const dist = Math.hypot(body.x - canvas.width / 2, body.y - canvas.height / 2);
+                return dist < 2000;
+            });
+            
+            // Draw
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.1)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            for (let body of bodies) {
+                body.draw(ctx);
+            }
+            
+            // Update UI
+            document.getElementById('bodyCount').textContent = bodies.length;
+            document.getElementById('fps').textContent = fps;
+            document.getElementById('nodeCount').textContent = quadTree.countNodes();
+            
+            requestAnimationFrame(simulate);
+        }
+        
+        // Event listeners
+        document.getElementById('resetBtn').addEventListener('click', initBodies);
+        document.getElementById('addBodyBtn').addEventListener('click', addRandomBody);
+        document.getElementById('clearBtn').addEventListener('click', () => {
+            bodies = [];
+        });
+        
+        document.getElementById('initialBodiesSlider').addEventListener('input', (e) => {
+            initialBodiesCount = parseInt(e.target.value);
+            document.getElementById('initialBodiesVal').textContent = initialBodiesCount;
+        });
+        
+        document.getElementById('gravitySlider').addEventListener('input', (e) => {
+            G = parseFloat(e.target.value);
+            document.getElementById('gravityVal').textContent = G.toFixed(1);
+        });
+        
+        document.getElementById('timeSlider').addEventListener('input', (e) => {
+            timeScale = parseFloat(e.target.value);
+            document.getElementById('timeVal').textContent = timeScale.toFixed(1);
+        });
+        
+        document.getElementById('thetaSlider').addEventListener('input', (e) => {
+            theta = parseFloat(e.target.value);
+            document.getElementById('thetaVal').textContent = theta.toFixed(1);
+        });
+        
+        canvas.addEventListener('click', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            
+            const vx = (Math.random() - 0.5) * 2;
+            const vy = (Math.random() - 0.5) * 2;
+            const mass = 20 + Math.random() * 80;
+            
+            bodies.push(new Body(x, y, vx, vy, mass));
+        });
+        
+        // Start simulation
+        initBodies();
+        simulate();
+    </script>
+</body>
+</html>
